@@ -1,0 +1,18 @@
+{
+  "name": "atlas-massive-discord-bot",
+  "version": "1.0.0",
+  "description": "Single-file Discord bot with 300+ slash-command subcommands",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "register": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^16.4.7",
+    "mongodb": "^6.12.0"
+  }
+}
