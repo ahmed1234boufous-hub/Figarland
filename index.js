@@ -1,446 +1,508 @@
-async function getSettings(guildId) {
-  return (await settings.findOne({guildId})) || {guildId};
+
+require('dotenv').config();
+
+const {
+  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
+  PermissionFlagsBits, EmbedBuilder, ChannelType
+} = require('discord.js');
+
+const { DISCORD_TOKEN, CLIENT_ID, BOT_NAME = 'Atlas' } = process.env;
+
+if (!DISCORD_TOKEN || !CLIENT_ID) {
+  console.error('Set DISCORD_TOKEN and CLIENT_ID in your .env file.');
+  process.exit(1);
 }
 
-async function patchSettings(guildId, patch) {
-  await settings.updateOne({guildId},{$set:{guildId,...patch}},{upsert:true});
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildModeration
+  ]
+});
+
+// 31 groups x 10 subcommands = 310 registered slash subcommands.
+const catalog = {
+  moderation: ['ban','unban','kick','timeout','untimeout','warn','warnings','clearwarnings','purge','slowmode'],
+  automod: ['status','enable','disable','filterwords','unfilterwords','antiinvite','antispam','antilink','capsfilter','mentionlimit'],
+  admin: ['announce','say','embed','lock','unlock','hide','unhide','renamechannel','settopic','serverinfo'],
+  roles: ['add','remove','create','delete','info','list','color','hoist','mentionable','autorole'],
+  tickets: ['panel','create','close','adduser','removeuser','rename','claim','transcript','setup','stats'],
+  economy: ['balance','daily','weekly','work','beg','crime','deposit','withdraw','pay','leaderboard'],
+  leveling: ['rank','level','xp','setxp','resetxp','leaderboard','rewards','setreward','announce','settings'],
+  utility: ['ping','help','botinfo','userinfo','avatar','banner','server','channel','role','invite'],
+  fun: ['8ball','coinflip','roll','choose','rate','ship','meme','joke','quote','rps'],
+  social: ['rep','give_rep','profile','marry','divorce','hug','pat','slap','kiss','highfive'],
+  welcome: ['setup','disable','test','setchannel','setmessage','setgoodbye','preview','autorole','settings','variables'],
+  logging: ['setup','disable','setchannel','messages','members','roles','channels','voice','mod','settings'],
+  giveaway: ['start','end','reroll','list','pause','resume','delete','edit','winners','settings'],
+  suggestions: ['setup','disable','submit','approve','deny','consider','list','stats','setchannel','settings'],
+  reactionroles: ['create','delete','list','add','remove','menu','button','verify','clear','settings'],
+  starboard: ['setup','disable','setchannel','threshold','ignore','unignore','stats','settings','test','clear'],
+  reminders: ['set','list','delete','clear','me','server','timezone','settings','snooze','help'],
+  polls: ['create','quick','end','results','list','delete','settings','anonymous','multi','ranked'],
+  music: ['play','skip','stop','pause','resume','queue','nowplaying','volume','loop','disconnect'],
+  ai: ['ask','summarize','translate','rewrite','explain','code','clear','persona','settings','usage'],
+  images: ['avatar','banner','servericon','emoji','sticker','meme','caption','pixelate','wanted','triggered'],
+  games: ['trivia','hangman','blackjack','slots','dice','duel','tictactoe','connect4','wordle','leaderboard'],
+  logs: ['latest','search','user','mod','export','clear','channel','message','settings','stats'],
+  custom: ['create','delete','edit','list','run','variables','permissions','cooldown','import','export'],
+  config: ['prefix','language','timezone','color','modules','permissions','autorole','welcome','goodbye','reset'],
+  backup: ['create','list','restore','delete','schedule','cancel','export','import','status','settings'],
+  stats: ['server','members','channels','roles','boosts','activity','messages','voice','growth','bot'],
+  applications: ['panel','create','accept','deny','review','questions','list','close','setup','stats'],
+  voice: ['tempchannel','rename','limit','bitrate','region','lock','unlock','claim','transfer','delete'],
+  security: ['verification','raidmode','lockdown','unlockdown','antinuke','whitelist','blacklist','audit','status','settings'],
+  utilityplus: ['calculator','permissions','timestamp','snowflake','poll','remind','shorten','decode','encode','userinfo']
+};
+
+const memory = {
+  warnings: new Map(),
+  xp: new Map(),
+  coins: new Map(),
+  settings: new Map()
+};
+
+const slug = s => s.toLowerCase()
+  .replace(/[^a-z0-9]+/g, '_')
+  .replace(/^_|_$/g, '');
+
+function buildCommands() {
+  return Object.entries(catalog).map(([group, names]) => {
+    const command = new SlashCommandBuilder()
+      .setName(group)
+      .setDescription(`${group} commands`);
+
+    for (const raw of names) {
+      const name = slug(raw);
+
+      command.addSubcommand(sub => {
+        sub.setName(name)
+          .setDescription(`${name.replaceAll('_',' ')} command`);
+
+        if ([
+          'ban','kick','timeout','untimeout','warn',
+          'warnings','clearwarnings','pay','add','remove'
+        ].includes(name)) {
+          sub.addUserOption(o =>
+            o.setName('user')
+              .setDescription('Target user')
+              .setRequired([
+                'ban','kick','timeout','warn','pay','add','remove'
+              ].includes(name))
+          );
+        }
+
+        if ([
+          'say','announce','embed','ask','translate',
+          'rewrite','explain','code','choose','create','quick'
+        ].includes(name)) {
+          sub.addStringOption(o =>
+            o.setName('text')
+              .setDescription('Text or question')
+              .setMaxLength(1500)
+              .setRequired([
+                'say','announce','ask','translate',
+                'rewrite','explain','code','choose'
+              ].includes(name))
+          );
+        }
+
+        if ([
+          'purge','slowmode','timeout','volume','limit',
+          'setxp','deposit','withdraw','pay'
+        ].includes(name)) {
+          sub.addIntegerOption(o =>
+            o.setName('amount')
+              .setDescription('Amount or seconds')
+              .setMinValue(1)
+              .setMaxValue(10000)
+          );
+        }
+
+        return sub;
+      });
+    }
+
+    return command;
+  });
 }
 
-function embed(title, description, color=0x5865F2) {
-  return new EmbedBuilder()
-    .setColor(color)
+const key = (guildId, userId) => `${guildId}:${userId}`;
+const getCoins = (g,u) => memory.coins.get(key(g,u)) || 0;
+const setCoins = (g,u,n) => memory.coins.set(key(g,u), Math.max(0,n));
+
+const makeEmbed = (title, description) =>
+  new EmbedBuilder()
+    .setColor(0x5865F2)
     .setTitle(title)
-    .setDescription(description || "—")
+    .setDescription(description)
     .setTimestamp();
+
+const isMod = i =>
+  i.memberPermissions?.has(PermissionFlagsBits.ModerateMembers) ||
+  i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+
+async function respond(i, content, ephemeral = true) {
+  const payload = typeof content === 'string'
+    ? { content, ephemeral }
+    : { ...content, ephemeral };
+
+  return i.replied || i.deferred
+    ? i.followUp(payload)
+    : i.reply(payload);
 }
 
-async function reply(i, content, ephemeral=true) {
-  const payload = typeof content === "string"
-    ? {content,ephemeral}
-    : {...content,ephemeral};
-
-  if (i.deferred || i.replied) return i.followUp(payload);
-  return i.reply(payload);
-}
-
-function isMod(i) {
-  return i.memberPermissions?.has(PermissionFlagsBits.ModerateMembers) ||
-    i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-}
-
-function needMod(i) {
-  if (!isMod(i)) {
-    throw new Error("You need Moderate Members or Manage Server permission.");
-  }
-}
-
-function optText(i) {
-  return i.options.getString("text") || "";
-}
-
-function optAmount(i) {
-  return i.options.getInteger("amount");
-}
-
-function target(i) {
-  return i.options.getUser("user");
-}
-
-const wait = ms => new Promise(r => setTimeout(r, ms));
-
-async function runCommand(i) {
+async function execute(i) {
   const group = i.commandName;
   const action = i.options.getSubcommand();
+  const user = i.options.getUser('user');
+  const text = i.options.getString('text') || '';
+  const amount = i.options.getInteger('amount') || 1;
   const guild = i.guild;
-  const user = i.user;
-  const textValue = optText(i);
-  const amount = optAmount(i);
-  const memberUser = target(i);
 
-  const s = guild ? await getSettings(guild.id) : {};
-  const member = memberUser
-    ? await guild.members.fetch(memberUser.id).catch(() => null)
+  const targetMember = user && guild
+    ? await guild.members.fetch(user.id).catch(() => null)
     : null;
 
-  // GENERAL UTILITIES
-  if (group === "utility" || group === "utilityplus") {
-    if (action === "ping") {
-      return reply(i, `Pong! **${client.ws.ping}ms** gateway latency.`);
-    }
+  // UTILITY
+  if (group === 'utility' || group === 'utilityplus') {
+    if (action === 'ping')
+      return respond(i, `Pong! Gateway latency: **${client.ws.ping}ms**.`);
 
-    if (action === "help") {
-      return reply(i, {
-        embeds: [
-          embed(
-            `${BRAND} commands`,
-            "31 command groups and 300+ subcommands. Try /moderation, /economy, /tickets, or /utility."
-          )
-        ]
+    if (action === 'help')
+      return respond(i, {
+        embeds: [makeEmbed(
+          `${BOT_NAME} Help`,
+          `Available groups: ${Object.keys(catalog).map(x => `\`${x}\``).join(', ')}`
+        )]
+      });
+
+    if (action === 'botinfo' || action === 'bot')
+      return respond(i, {
+        embeds: [makeEmbed(
+          BOT_NAME,
+          `Servers: ${client.guilds.cache.size}\nUsers cached: ${client.users.cache.size}\nDiscord.js: ${require('discord.js').version}`
+        )]
+      });
+
+    if (action === 'server' || action === 'serverinfo')
+      return respond(i, {
+        embeds: [makeEmbed(
+          guild.name,
+          `Members: ${guild.memberCount}\nChannels: ${guild.channels.cache.size}\nRoles: ${guild.roles.cache.size}`
+        )]
+      });
+
+    if (action === 'userinfo' || action === 'profile') {
+      const u = user || i.user;
+      return respond(i, {
+        embeds: [makeEmbed(
+          u.tag || u.username,
+          `ID: ${u.id}\nCreated: <t:${Math.floor(u.createdTimestamp/1000)}:R>`
+        ).setThumbnail(u.displayAvatarURL())]
       });
     }
 
-    if (action === "botinfo") {
-      return reply(i, {
-        embeds: [
-          embed(
-            BRAND,
-            `Servers: ${client.guilds.cache.size}
-Users cached: ${client.users.cache.size}
-Node: ${process.version}
-Discord.js: ${require("discord.js").version}`
-          )
-        ]
+    if (action === 'avatar') {
+      const u = user || i.user;
+      return respond(i, {
+        embeds: [makeEmbed('Avatar', u.displayAvatarURL({ size: 1024 }))]
       });
     }
 
-    if (action === "server" || action === "serverinfo") {
-      return reply(i, {
-        embeds: [
-          embed(
-            guild.name,
-            `Members: ${guild.memberCount}
-Channels: ${guild.channels.cache.size}
-Roles: ${guild.roles.cache.size}
-Created: <t:${Math.floor(guild.createdTimestamp / 1000)}:D>`
-          )
-        ]
-      });
-    }
+    if (action === 'channel')
+      return respond(i, `Channel: ${i.channel} | ID: ${i.channelId}`);
 
-    if (action === "userinfo" || action === "profile") {
-      const u = memberUser || user;
-      return reply(i, {
-        embeds: [
-          embed(
-            u.tag || u.username,
-            `ID: ${u.id}
-Created: <t:${Math.floor(u.createdTimestamp / 1000)}:R>`
-          ).setThumbnail(u.displayAvatarURL())
-        ]
-      });
-    }
+    if (action === 'invite')
+      return respond(i, `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=8&scope=bot%20applications.commands`);
 
-    if (action === "avatar") {
-      const u = memberUser || user;
-      return reply(i, {
-        embeds: [
-          embed("Avatar", u.displayAvatarURL({size: 1024}))
-        ]
-      });
-    }
+    if (action === 'timestamp')
+      return respond(i, `Unix timestamp: ${Math.floor(Date.now()/1000)}`);
 
-    if (action === "channel") {
-      return reply(i, `Channel: ${i.channel} • ID: \`${i.channelId}\``);
-    }
+    if (action === 'snowflake')
+      return respond(i, `Your ID: ${i.user.id}`);
 
-    if (action === "role") {
-      return reply(i, `Roles in this server: ${guild.roles.cache.size}`);
-    }
-
-    if (action === "invite") {
-      return reply(i,
-        `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=8&scope=bot%20applications.commands`
-      );
-    }
-
-    if (action === "timestamp") {
-      return reply(i, `Unix timestamp: \`${Math.floor(Date.now() / 1000)}\``);
-    }
-
-    if (action === "snowflake") {
-      return reply(i, `Your Discord ID: \`${user.id}\``);
-    }
-
-    if (action === "calculator") {
-      const m = textValue.match(/^\s*[\d+\-*/(). %]+\s*$/);
-      if (!m) {
-        return reply(i, "Provide a basic arithmetic expression in the text option.");
-      }
-
-      const tokens = textValue.match(/\d+(?:\.\d+)?|[()+\-*/%]/g) || [];
-
-      if (tokens.join("") !== textValue.replace(/\s/g, "")) {
-        return reply(i, "Invalid expression.");
-      }
-
-      const nums = [];
-      const ops = [];
-      const prec = {"+":1, "-":1, "*":2, "/":2, "%":2};
-
-      const apply = () => {
-        const op = ops.pop();
-        const b = nums.pop();
-        const a = nums.pop();
-
-        if (op === "+") nums.push(a + b);
-        if (op === "-") nums.push(a - b);
-        if (op === "*") nums.push(a * b);
-        if (op === "/") nums.push(a / b);
-        if (op === "%") nums.push(a % b);
-      };
-
-      let prev = true;
-
-      for (const t of tokens) {
-        if (/^\d/.test(t)) {
-          nums.push(Number(t));
-          prev = false;
-        } else if (t === "(") {
-          ops.push(t);
-          prev = true;
-        } else if (t === ")") {
-          while (ops.length && ops.at(-1) !== "(") apply();
-          ops.pop();
-          prev = false;
-        } else {
-          if (t === "-" && prev) nums.push(0);
-          while (ops.length && prec[ops.at(-1)] >= prec[t]) apply();
-          ops.push(t);
-          prev = true;
-        }
-      }
-
-      while (ops.length) apply();
-      return reply(i, `Result: **${nums[0]}**`);
-    }
+    if (action === 'calculator')
+      return respond(i, 'Calculator is registered but not implemented in this lightweight build.');
   }
 
   // MODERATION
-  if (group === "moderation") {
-    needMod(i);
+  if (group === 'moderation') {
+    if (!isMod(i))
+      throw new Error('You need Moderate Members or Manage Server permission.');
 
-    if (action === "purge") {
-      if (!i.memberPermissions.has(PermissionFlagsBits.ManageMessages)) {
-        throw new Error("Manage Messages permission required.");
-      }
+    if ([
+      'ban','kick','timeout','untimeout',
+      'warn','warnings','clearwarnings'
+    ].includes(action) && !user)
+      throw new Error('Select a user.');
 
-      const n = Math.min(Math.max(amount || 10, 1), 100);
-      const deleted = await i.channel.bulkDelete(n, true);
-      return reply(i, `Deleted **${deleted.size}** messages.`);
+    if (action === 'ban') {
+      if (!i.memberPermissions.has(PermissionFlagsBits.BanMembers))
+        throw new Error('Ban Members permission required.');
+
+      await targetMember.ban({ reason: 'Moderator action' });
+      return respond(i, `Banned ${user.tag}.`);
     }
 
-    if (["ban","kick","timeout","untimeout","warn","clearwarnings"].includes(action) && !memberUser) {
-      throw new Error("Select a user.");
+    if (action === 'kick') {
+      if (!i.memberPermissions.has(PermissionFlagsBits.KickMembers))
+        throw new Error('Kick Members permission required.');
+
+      await targetMember.kick();
+      return respond(i, `Kicked ${user.tag}.`);
     }
 
-    if (action === "ban") {
-      if (!i.memberPermissions.has(PermissionFlagsBits.BanMembers)) {
-        throw new Error("Ban Members permission required.");
-      }
-
-      await member.ban({reason: "Moderator action"});
-      return reply(i, `Banned ${memberUser.tag}.`);
+    if (action === 'timeout') {
+      await targetMember.timeout(Math.min(amount*60000, 2419200000));
+      return respond(i, `Timed out ${user.tag} for ${amount} minute(s).`);
     }
 
-    if (action === "kick") {
-      if (!i.memberPermissions.has(PermissionFlagsBits.KickMembers)) {
-        throw new Error("Kick Members permission required.");
-      }
-
-      await member.kick();
-      return reply(i, `Kicked ${memberUser.tag}.`);
+    if (action === 'untimeout') {
+      await targetMember.timeout(null);
+      return respond(i, `Removed timeout from ${user.tag}.`);
     }
 
-    if (action === "timeout") {
-      const ms = Math.min(Math.max((amount || 10) * 60000, 60000), 2419200000);
-      await member.timeout(ms);
-      return reply(i, `Timed out ${memberUser.tag}.`);
+    if (action === 'warn') {
+      const k = key(guild.id,user.id);
+      const a = memory.warnings.get(k) || [];
+      a.push({ reason: text || 'No reason supplied', by: i.user.id, at: Date.now() });
+      memory.warnings.set(k,a);
+      return respond(i, `Warned ${user.tag}. Total warnings: ${a.length}.`);
     }
 
-    if (action === "untimeout") {
-      await member.timeout(null);
-      return reply(i, `Removed timeout from ${memberUser.tag}.`);
+    if (action === 'warnings')
+      return respond(i, `${user.tag} has ${(memory.warnings.get(key(guild.id,user.id))||[]).length} warning(s).`);
+
+    if (action === 'clearwarnings') {
+      memory.warnings.delete(key(guild.id,user.id));
+      return respond(i, `Cleared warnings for ${user.tag}.`);
     }
 
-    if (action === "warn") {
-      const list = (await warnings.findOne({
-        guildId: guild.id,
-        userId: memberUser.id
-      }))?.items || [];
+    if (action === 'purge') {
+      if (!i.memberPermissions.has(PermissionFlagsBits.ManageMessages))
+        throw new Error('Manage Messages permission required.');
 
-      list.push({
-        by: user.id,
-        at: Date.now(),
-        reason: textValue || "No reason supplied"
-      });
-
-      await warnings.updateOne(
-        {guildId: guild.id, userId: memberUser.id},
-        {$set: {items: list}},
-        {upsert: true}
-      );
-
-      return reply(i, `Warned ${memberUser.tag}. Total warnings: **${list.length}**.`);
+      const n = await i.channel.bulkDelete(Math.min(amount,100),true);
+      return respond(i, `Deleted ${n.size} messages.`);
     }
 
-    if (action === "warnings") {
-      const u = memberUser || user;
-      const list = (await warnings.findOne({
-        guildId: guild.id,
-        userId: u.id
-      }))?.items || [];
-
-      return reply(i, `**${u.tag}** has ${list.length} warning(s).`);
+    if (action === 'slowmode') {
+      await i.channel.setRateLimitPerUser(Math.min(amount,21600));
+      return respond(i, `Slowmode set to ${amount} seconds.`);
     }
-
-    if (action === "clearwarnings") {
-      await warnings.deleteOne({
-        guildId: guild.id,
-        userId: memberUser.id
-      });
-
-      return reply(i, `Cleared warnings for ${memberUser.tag}.`);
-    }
-
-    if (action === "slowmode") {
-      const seconds = Math.min(amount || 5, 21600);
-      await i.channel.setRateLimitPerUser(seconds);
-      return reply(i, `Slowmode set to ${seconds} seconds.`);
-    }
-
-    return reply(i,
-      `Moderation action **${action}** requires its specific configuration or target options.`
-    );
   }
 
-  // ADMINISTRATION
-  if (group === "admin") {
-    needMod(i);
+  // ADMIN
+  if (group === 'admin') {
+    if (!isMod(i))
+      throw new Error('Manage Server permission required.');
 
-    if (action === "say") {
-      return reply(i, textValue, false);
-    }
+    if (action === 'say')
+      return respond(i, text, false);
 
-    if (action === "announce") {
-      return reply(i, {
-        embeds: [embed("Announcement", textValue)]
+    if (action === 'announce' || action === 'embed')
+      return respond(i, {
+        embeds: [makeEmbed(
+          action === 'announce' ? 'Announcement' : 'Custom Embed',
+          text
+        )]
       }, false);
-    }
 
-    if (action === "lock" || action === "unlock") {
+    if (action === 'lock' || action === 'unlock') {
       await i.channel.permissionOverwrites.edit(
         guild.roles.everyone,
-        {SendMessages: action === "unlock" ? null : false}
+        { SendMessages: action === 'unlock' ? null : false }
       );
-
-      return reply(i, `Channel ${action}ed.`);
+      return respond(i, `Channel ${action}ed.`);
     }
 
-    if (action === "hide" || action === "unhide") {
+    if (action === 'hide' || action === 'unhide') {
       await i.channel.permissionOverwrites.edit(
         guild.roles.everyone,
-        {ViewChannel: action === "unhide" ? null : false}
+        { ViewChannel: action === 'unhide' ? null : false }
       );
-
-      return reply(i, "Channel visibility updated.");
+      return respond(i, 'Channel visibility updated.');
     }
 
-    if (action === "renamechannel") {
-      await i.channel.setName(
-        textValue.slice(0, 100) || `channel-${Date.now()}`
-      );
-
-      return reply(i, "Channel renamed.");
+    if (action === 'renamechannel') {
+      await i.channel.setName(text || `channel-${Date.now()}`);
+      return respond(i, 'Channel renamed.');
     }
 
-    if (action === "settopic") {
-      await i.channel.setTopic(textValue.slice(0, 1024));
-      return reply(i, "Channel topic updated.");
-    }
-
-    if (action === "embed") {
-      return reply(i, {
-        embeds: [embed("Custom embed", textValue)]
-      }, false);
+    if (action === 'settopic') {
+      await i.channel.setTopic(text);
+      return respond(i, 'Channel topic updated.');
     }
   }
 
   // ECONOMY
-  if (group === "economy") {
-    const p = await getProfile(guild.id, user.id);
-    const now = Date.now();
+  if (group === 'economy') {
+    const coins = getCoins(guild.id,i.user.id);
 
-    if (action === "balance") {
-      return reply(i,
-        `Wallet: **${p.coins || 0}** coins
-Bank: **${p.bank || 0}** coins`
-      );
+    if (action === 'balance')
+      return respond(i, `Wallet: **${coins}** coins.`);
+
+    if (action === 'daily' || action === 'weekly') {
+      const reward = action === 'daily' ? 250 : 1500;
+      setCoins(guild.id,i.user.id,coins+reward);
+      return respond(i, `You collected **${reward}** coins.`);
     }
 
-    if (action === "daily" || action === "weekly") {
-      const key = action === "daily" ? "lastDaily" : "lastWeekly";
-      const cooldown = action === "daily" ? 86400000 : 604800000;
+    if (['work','beg','crime'].includes(action)) {
+      const reward = action === 'work'
+        ? 100
+        : action === 'beg'
+          ? 20
+          : Math.floor(Math.random()*301)-100;
 
-      if (now - (p[key] || 0) < cooldown) {
-        return reply(i,
-          `Available <t:${Math.floor((p[key] + cooldown) / 1000)}:R>.`
-        );
-      }
+      setCoins(guild.id,i.user.id,coins+reward);
 
-      const reward = action === "daily" ? 250 : 1500;
-
-      await patchProfile(guild.id, user.id, {
-        [key]: now,
-        coins: (p.coins || 0) + reward
-      });
-
-      return reply(i, `You collected **${reward}** coins.`);
+      return respond(i, reward >= 0
+        ? `You earned **${reward}** coins.`
+        : `You lost **${-reward}** coins.`);
     }
 
-    if (["work","beg","crime"].includes(action)) {
-      const reward = action === "work" ? [80,180] :
-        action === "beg" ? [5,45] : [-100,350];
+    if (action === 'pay') {
+      if (!user || user.bot || user.id === i.user.id)
+        throw new Error('Choose another human user.');
 
-      const n = Math.floor(
-        Math.random() * (reward[1] - reward[0] + 1)
-      ) + reward[0];
+      if (coins < amount)
+        throw new Error('Insufficient balance.');
 
-      await patchProfile(guild.id, user.id, {
-        coins: Math.max(0, (p.coins || 0) + n)
-      });
+      setCoins(guild.id,i.user.id,coins-amount);
+      setCoins(guild.id,user.id,getCoins(guild.id,user.id)+amount);
 
-      return reply(i,
-        n >= 0 ? `You earned **${n}** coins.` : `You lost **${-n}** coins.`
-      );
-    }
-
-    if (action === "deposit" || action === "withdraw") {
-      const n = Math.max(1, amount || 0);
-
-      if (action === "deposit" && (p.coins || 0) < n) {
-        throw new Error("Not enough wallet coins.");
-      }
-
-      if (action === "withdraw" && (p.bank || 0) < n) {
-        throw new Error("Not enough bank coins.");
-      }
-
-      await patchProfile(guild.id, user.id, {
-        coins: (p.coins || 0) + (action === "withdraw" ? n : -n),
-        bank: (p.bank || 0) + (action === "deposit" ? n : -n)
-      });
-
-      return reply(i, `${action}ed **${n}** coins.`);
-    }
-
-    if (action === "pay") {
-      if (!memberUser || memberUser.bot || memberUser.id === user.id) {
-        throw new Error("Choose another human user.");
-      }
-
-      const n = Math.max(1, amount || 0);
-
-      if ((p.coins || 0) < n) {
-        throw new Error("Insufficient balance.");
-      }
-
-      const q = await getProfile(guild.id, memberUser.id);
-
-      await patchProfile(guild.id, user.id, {coins: p.coins - n});
-      await patchProfile(guild.id, memberUser.id, {
-        coins: (q.coins || 0) + n
-      });
-
-      return reply(i, `Paid **${n}** coins to ${memberUser}.`);
+      return respond(i, `Paid ${amount} coins to ${user}.`);
     }
   }
+
+  // LEVELING
+  if (group === 'leveling' && ['rank','level','xp'].includes(action)) {
+    const xp = memory.xp.get(key(guild.id,user?.id || i.user.id)) || 0;
+    return respond(i, `XP: **${xp}** | Level: **${Math.floor(Math.sqrt(xp/100))}**`);
+  }
+
+  // FUN
+  if (group === 'fun') {
+    if (action === 'coinflip')
+      return respond(i, Math.random() < .5 ? 'Heads' : 'Tails');
+
+    if (action === 'roll')
+      return respond(i, `You rolled **${Math.floor(Math.random()*6)+1}**.`);
+
+    if (action === '8ball')
+      return respond(i, ['Yes.','No.','Definitely.','Unlikely.','Ask again later.'][Math.floor(Math.random()*5)]);
+
+    if (action === 'choose')
+      return respond(i, `I choose: **${text.split(',').map(x=>x.trim()).filter(Boolean).sort(()=>Math.random()-.5)[0] || 'Nothing'}**`);
+
+    if (action === 'joke')
+      return respond(i, 'Why did the developer go broke? Because they used up all their cache.');
+  }
+
+  // POLLS
+  if (group === 'polls' && ['create','quick'].includes(action)) {
+    if (!text) throw new Error('Provide poll text.');
+
+    const msg = await i.channel.send({
+      embeds: [makeEmbed('Poll',text)]
+    });
+
+    await msg.react('👍');
+    await msg.react('👎');
+
+    return respond(i, `Poll created: ${msg.url}`);
+  }
+
+  // TICKETS
+  if (group === 'tickets' && action === 'create') {
+    const ch = await guild.channels.create({
+      name: `ticket-${i.user.username}`.toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,90),
+      type: ChannelType.GuildText,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone,
+          deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+          id: i.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory
+          ]
+        }
+      ]
+    });
+
+    await ch.send(`${i.user} Support ticket created.`);
+    return respond(i, `Ticket created: ${ch}`);
+  }
+
+  // FEATURES THAT NEED ADDITIONAL INTEGRATIONS
+  const notes = {
+    music: 'Music playback needs an audio node/service and a supported source.',
+    ai: 'AI commands need an AI provider and API key.',
+    images: 'Image tools need an image-processing library or service.',
+    backup: 'Backup commands need a configured storage destination.',
+    giveaway: 'Giveaway scheduling and winner selection need a scheduler.',
+    reminders: 'Reminder delivery needs a persistent scheduler.',
+    security: 'Security automation needs explicit rules and allowlists.',
+    voice: 'Voice features need their dedicated voice-state implementation.'
+  };
+
+  return respond(i, notes[group] ||
+    `/${group} ${action} is registered. This command needs its feature-specific implementation or configuration.`);
+}
+
+// REGISTER COMMANDS
+client.once('ready', async () => {
+  console.log(`${BOT_NAME} online as ${client.user.tag}`);
+
+  try {
+    const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+    const commands = buildCommands().map(c => c.toJSON());
+
+    await rest.put(
+      Routes.applicationCommands(CLIENT_ID),
+      { body: commands }
+    );
+
+    console.log(
+      `Registered ${commands.length} command groups and ${commands.reduce((n,c)=>n+c.options.length,0)} subcommands.`
+    );
+  } catch (error) {
+    console.error('Command registration failed:', error);
+  }
+});
+
+// INTERACTIONS
+client.on('interactionCreate', async i => {
+  if (!i.isChatInputCommand()) return;
+
+  try {
+    await execute(i);
+  } catch (error) {
+    console.error(error);
+    await respond(i, `Error: ${error.message || 'Unexpected error'}`).catch(()=>{});
+  }
+});
+
+// XP SYSTEM (RAM ONLY)
+client.on('messageCreate', message => {
+  if (message.author.bot || !message.guild) return;
+
+  const k = key(message.guild.id,message.author.id);
+  const xp = (memory.xp.get(k)||0) + Math.floor(Math.random()*8) + 8;
+
+  memory.xp.set(k,xp);
+});
+
+client.login(DISCORD_TOKEN).catch(error => {
+  console.error('Login failed:', error);
+  process.exit(1);
+});
